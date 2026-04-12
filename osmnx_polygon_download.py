@@ -8,7 +8,7 @@ Supports:
 - Greenspace (parks, forests, etc.)
 
 The polygon can be supplied as:
-- A Shapefile / GeoPackage path
+- A Shapefile / GeoPackage path  (one polygon per row, city name from a column)
 - A place name resolved by the Nominatim geocoder
 - A list of (lat, lon) coordinate tuples
 
@@ -18,15 +18,23 @@ Outputs are saved as GeoPackage layers under a user-defined output directory.
 from __future__ import annotations
 
 import logging
+import re
+import traceback
 from pathlib import Path
 from typing import Literal, Sequence
 
 import geopandas as gpd
 import osmnx as ox
-from shapely.geometry import MultiPolygon, Polygon, mapping
+from shapely.geometry import MultiPolygon, Polygon
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Project-level paths  (edit these two lines to match your environment)
+# ---------------------------------------------------------------------------
+FUA_SHP  = r"D:\000_SCI\10_Compact_city\3_FUA_reference\GHS_FUA_cities_subset_clean.shp"
+CITY_COL = "eFUA_name"
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -38,6 +46,33 @@ NetworkType = Literal["all", "all_public", "bike", "drive", "drive_service", "wa
 # ---------------------------------------------------------------------------
 # Polygon loading utilities
 # ---------------------------------------------------------------------------
+
+
+def load_fua_shapefile(
+    shp_path: str | Path = FUA_SHP,
+    city_col: str = CITY_COL,
+) -> gpd.GeoDataFrame:
+    """Load the FUA shapefile and ensure it is in EPSG:4326.
+
+    Parameters
+    ----------
+    shp_path:
+        Path to the FUA Shapefile (e.g. ``GHS_FUA_cities_subset_clean.shp``).
+    city_col:
+        Column that contains the city name (default: ``"eFUA_name"``).
+
+    Returns
+    -------
+    GeoDataFrame with at least two columns: *city_col* and *geometry*.
+    """
+    gdf = gpd.read_file(shp_path)
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+    if city_col not in gdf.columns:
+        raise KeyError(
+            f"Column '{city_col}' not found. Available columns: {list(gdf.columns)}"
+        )
+    return gdf
 
 
 def polygon_from_file(path: str | Path, layer: int | str = 0) -> Polygon | MultiPolygon:
@@ -321,60 +356,121 @@ def _save_gdf(gdf: gpd.GeoDataFrame, path: str | Path, layer: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Example usage
+# Batch download: iterate every city in the FUA shapefile
+# ---------------------------------------------------------------------------
+
+
+def _safe_dirname(name: str) -> str:
+    """Convert a city name to a safe directory name (no special chars)."""
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+
+
+def download_fua_batch(
+    shp_path: str | Path = FUA_SHP,
+    city_col: str = CITY_COL,
+    output_root: str | Path = r"D:\000_SCI\10_Compact_city\OSM_data",
+    network_type: NetworkType = "drive",
+    skip_existing: bool = True,
+) -> None:
+    """Download OSM data for every city polygon in the FUA shapefile.
+
+    For each row the script creates::
+
+        <output_root>/<city_name>/<city_name>_osm.gpkg
+
+    The GeoPackage contains five layers: roads, buildings, pois, landuse,
+    and greenspace.
+
+    Parameters
+    ----------
+    shp_path:
+        Path to the FUA Shapefile.
+    city_col:
+        Column with city names (default ``"eFUA_name"``).
+    output_root:
+        Root directory where per-city sub-folders are created.
+    network_type:
+        OSMnx road-network type (``"drive"``, ``"all"``, ``"walk"``, …).
+    skip_existing:
+        If ``True``, skip a city whose ``.gpkg`` file already exists
+        (allows resuming an interrupted run).
+    """
+    fua = load_fua_shapefile(shp_path, city_col)
+    output_root = Path(output_root)
+    total = len(fua)
+    failed: list[str] = []
+
+    logger.info("FUA shapefile loaded: %d cities to process.", total)
+
+    for idx, row in fua.iterrows():
+        city_name = str(row[city_col])
+        safe_name = _safe_dirname(city_name)
+        city_dir  = output_root / safe_name
+        gpkg_path = city_dir / f"{safe_name}_osm.gpkg"
+
+        logger.info(
+            "[%d/%d] %s",
+            int(idx) + 1 if isinstance(idx, int) else list(fua.index).index(idx) + 1,
+            total,
+            city_name,
+        )
+
+        if skip_existing and gpkg_path.exists():
+            logger.info("  Already exists — skipping.")
+            continue
+
+        polygon = row.geometry
+        if polygon is None or polygon.is_empty:
+            logger.warning("  Empty geometry — skipping.")
+            continue
+
+        city_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            download_road_network(polygon, network_type, gpkg_path)
+            download_buildings(polygon, gpkg_path)
+            download_pois(polygon, output_path=gpkg_path)
+            download_landuse(polygon, gpkg_path)
+            download_greenspace(polygon, gpkg_path)
+            logger.info("  Done → %s", gpkg_path)
+        except Exception:
+            logger.error("  FAILED for %s:\n%s", city_name, traceback.format_exc())
+            failed.append(city_name)
+
+    # Summary
+    logger.info("=" * 60)
+    logger.info("Batch complete. %d / %d cities succeeded.", total - len(failed), total)
+    if failed:
+        logger.warning("Failed cities (%d):", len(failed))
+        for name in failed:
+            logger.warning("  - %s", name)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     # ------------------------------------------------------------------ #
-    # Option 1: polygon from a place name (Nominatim geocoding)
+    # Batch download all cities from the FUA shapefile
+    # Edit FUA_SHP / CITY_COL at the top of this file if needed.
     # ------------------------------------------------------------------ #
-    polygon_place = polygon_from_place("Gangnam-gu, Seoul, South Korea")
-
-    # ------------------------------------------------------------------ #
-    # Option 2: polygon loaded from an existing Shapefile / GeoPackage
-    # ------------------------------------------------------------------ #
-    # polygon_file = polygon_from_file("path/to/boundary.shp")
-
-    # ------------------------------------------------------------------ #
-    # Option 3: polygon defined manually as (lat, lon) coordinates
-    # ------------------------------------------------------------------ #
-    # coords = [
-    #     (37.514, 127.019),
-    #     (37.514, 127.100),
-    #     (37.557, 127.100),
-    #     (37.557, 127.019),
-    #     (37.514, 127.019),
-    # ]
-    # polygon_manual = polygon_from_coords(coords)
-
-    # ------------------------------------------------------------------ #
-    # Download individual layers
-    # ------------------------------------------------------------------ #
-    out_dir = Path("osm_output") / "Gangnam"
-
-    roads = download_road_network(
-        polygon_place,
+    download_fua_batch(
+        shp_path=FUA_SHP,
+        city_col=CITY_COL,
+        output_root=r"D:\000_SCI\10_Compact_city\OSM_data",
         network_type="drive",
-        output_path=out_dir / "roads.gpkg",
-    )
-
-    buildings = download_buildings(
-        polygon_place,
-        output_path=out_dir / "buildings.gpkg",
-    )
-
-    pois = download_pois(
-        polygon_place,
-        amenity_filter=["school", "hospital", "restaurant", "cafe", "bank"],
-        output_path=out_dir / "pois.gpkg",
+        skip_existing=True,   # resume-safe: skips cities already downloaded
     )
 
     # ------------------------------------------------------------------ #
-    # OR download everything into a single GeoPackage
+    # Single-city download (uncomment to use)
     # ------------------------------------------------------------------ #
-    # results = download_all(
-    #     polygon_place,
-    #     output_dir="osm_output",
-    #     city_name="Gangnam",
+    # fua = load_fua_shapefile()
+    # row = fua[fua[CITY_COL] == "Seoul"].iloc[0]
+    # download_all(
+    #     row.geometry,
+    #     output_dir=r"D:\000_SCI\10_Compact_city\OSM_data\Seoul",
+    #     city_name="Seoul",
     #     network_type="drive",
     # )
