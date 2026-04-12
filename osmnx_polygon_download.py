@@ -158,7 +158,11 @@ def download_buildings(
     polygon: Polygon | MultiPolygon,
     output_path: str | Path | None = None,
 ) -> gpd.GeoDataFrame:
-    """Download building footprints inside *polygon*.
+    """Download building footprints strictly inside *polygon*.
+
+    Only polygon geometries (footprints) are kept; point-tagged buildings
+    are excluded.  Results are clipped to the polygon boundary so no
+    geometry extends outside it.
 
     Parameters
     ----------
@@ -169,12 +173,15 @@ def download_buildings(
 
     Returns
     -------
-    GeoDataFrame of building polygons.
+    GeoDataFrame of building footprints clipped to *polygon*.
     """
     logger.info("Downloading building footprints ...")
     tags = {"building": True}
     gdf = ox.features_from_polygon(polygon, tags=tags)
+    # Keep only polygon footprints (not point-tagged buildings)
     gdf = _keep_polygon_geom(gdf)
+    # Clip to the polygon boundary so no footprint extends outside it
+    gdf = gdf.clip(polygon)
 
     if output_path is not None:
         _save_gdf(gdf, output_path, layer="buildings")
@@ -184,12 +191,16 @@ def download_buildings(
     return gdf
 
 
-def download_pois(
+def download_amenities(
     polygon: Polygon | MultiPolygon,
     amenity_filter: list[str] | None = None,
     output_path: str | Path | None = None,
 ) -> gpd.GeoDataFrame:
-    """Download Points of Interest (POI / amenities) inside *polygon*.
+    """Download all OSM amenity features inside *polygon*.
+
+    Includes every geometry type (points, lines, polygons) since amenities
+    can be mapped as nodes, ways, or relations in OSM.  Results are clipped
+    to the polygon boundary.
 
     Parameters
     ----------
@@ -197,24 +208,30 @@ def download_pois(
         Boundary polygon (EPSG:4326).
     amenity_filter:
         Subset of amenity values to keep, e.g. ``["school", "hospital"]``.
-        Pass ``None`` to download all amenities.
+        Pass ``None`` (default) to download **all** amenity types.
     output_path:
         Optional save path.
 
     Returns
     -------
-    GeoDataFrame of POI features.
+    GeoDataFrame of amenity features clipped to *polygon*.
     """
-    logger.info("Downloading POIs ...")
+    logger.info("Downloading amenities ...")
     tags = {"amenity": amenity_filter if amenity_filter else True}
     gdf = ox.features_from_polygon(polygon, tags=tags)
+    # Clip to the polygon boundary
+    gdf = gdf.clip(polygon)
 
     if output_path is not None:
-        _save_gdf(gdf, output_path, layer="pois")
-        logger.info("POIs saved → %s", output_path)
+        _save_gdf(gdf, output_path, layer="amenities")
+        logger.info("Amenities saved → %s", output_path)
 
-    logger.info("  %d POI features downloaded.", len(gdf))
+    logger.info("  %d amenity features downloaded.", len(gdf))
     return gdf
+
+
+# Keep old name as an alias so existing call-sites don't break
+download_pois = download_amenities
 
 
 def download_landuse(
@@ -318,11 +335,11 @@ def download_all(
 
     results: dict[str, gpd.GeoDataFrame] = {}
 
-    results["roads"] = download_road_network(polygon, network_type, gpkg)
-    results["buildings"] = download_buildings(polygon, gpkg)
-    results["pois"] = download_pois(polygon, output_path=gpkg)
-    results["landuse"] = download_landuse(polygon, gpkg)
-    results["greenspace"] = download_greenspace(polygon, gpkg)
+    results["roads"]       = download_road_network(polygon, network_type, gpkg)
+    results["buildings"]   = download_buildings(polygon, gpkg)
+    results["amenities"]   = download_amenities(polygon, output_path=gpkg)
+    results["landuse"]     = download_landuse(polygon, gpkg)
+    results["greenspace"]  = download_greenspace(polygon, gpkg)
 
     logger.info("All layers saved to %s", gpkg)
     return results
@@ -429,7 +446,7 @@ def download_fua_batch(
         try:
             download_road_network(polygon, network_type, gpkg_path)
             download_buildings(polygon, gpkg_path)
-            download_pois(polygon, output_path=gpkg_path)
+            download_amenities(polygon, output_path=gpkg_path)
             download_landuse(polygon, gpkg_path)
             download_greenspace(polygon, gpkg_path)
             logger.info("  Done → %s", gpkg_path)
