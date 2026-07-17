@@ -493,17 +493,41 @@ def run_pipeline_qgis(
 # ===========================================================================
 
 if __name__ == "__main__":
-    # Edit these paths/fields to match your data, then run:  python svf_from_dem.py
+    # ------------------------------------------------------------------ #
+    # Folder layout: everything lives under one BASE folder, with each
+    # input and each output stage in its own subfolder.
+    #
+    #   BASE/
+    #     01_contours/  contours.shp      <- input: elevation contour lines
+    #     02_buildings/ buildings.gpkg    <- input: footprints with height
+    #     03_DEM/       dem.tif           <- output: interpolated terrain
+    #     04_DSM/       dsm.tif           <- output: terrain + buildings
+    #     05_SVF/       svf.tif           <- output: sky view factor
+    #
+    # Edit BASE (and the field names below) to match your data.
+    # ------------------------------------------------------------------ #
+    BASE = Path(r"D:\SVF_project")
+
+    contours  = BASE / "01_contours"  / "contours.shp"
+    buildings = BASE / "02_buildings" / "buildings.gpkg"
+    out_dem   = BASE / "03_DEM" / "dem.tif"
+    out_dsm   = BASE / "04_DSM" / "dsm.tif"
+    out_svf   = BASE / "05_SVF" / "svf.tif"
+
+    # Create the output subfolders if they don't exist yet
+    for _p in (out_dem, out_dsm, out_svf):
+        _p.parent.mkdir(parents=True, exist_ok=True)
+
     run_pipeline_py(
-        contours=r"D:\data\contours.shp",   # elevation contour lines
-        elev_field="ELEV",                  # contour elevation attribute (m)
-        buildings=r"D:\data\buildings.gpkg",# footprints with a height field
-        height_field="height",              # building height attribute (m)
-        cell_size=2.0,                      # output resolution (m/pixel)
-        out_dem=r"D:\data\dem.tif",
-        out_dsm=r"D:\data\dsm.tif",
-        out_svf=r"D:\data\svf.tif",
-        n_dirs=16,                          # azimuth directions
-        max_radius=200.0,                   # search radius (m)
-        interp_method="linear",             # TIN interpolation
+        contours=contours,
+        elev_field="ELEV",        # contour elevation attribute (m)
+        buildings=buildings,
+        height_field="height",    # building height attribute (m)
+        cell_size=2.0,            # output resolution (m/pixel)
+        out_dem=out_dem,
+        out_dsm=out_dsm,
+        out_svf=out_svf,
+        n_dirs=16,                # azimuth directions
+        max_radius=200.0,         # search radius (m)
+        interp_method="linear",   # TIN interpolation
     )
