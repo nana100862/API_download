@@ -1,12 +1,13 @@
-"""Sky View Factor (SVF) from a DEM (built from contours) + building heights.
+"""Sky View Factor (SVF) from an existing DEM raster + building heights.
 
 Workflow implemented here
 -------------------------
-1. **Contours -> DEM**   : interpolate elevation contour lines onto a raster
-   Digital Elevation Model (bare-earth terrain).
-2. **DEM + buildings -> DSM** : rasterize building footprints by their height
+The DEM (bare-earth terrain) is supplied as a ready-made raster and read
+directly -- it is **not** computed here.
+
+1. **DEM + buildings -> DSM** : rasterize building footprints by their height
    and add them onto the DEM to obtain a Digital Surface Model.
-3. **DSM -> SVF**        : for every cell, cast ``n_dirs`` azimuth rays, find
+2. **DSM -> SVF**        : for every cell, cast ``n_dirs`` azimuth rays, find
    the maximum horizon (elevation) angle within ``max_radius`` in each
    direction, and combine them with the isotropic-sky approximation::
 
@@ -16,19 +17,22 @@ Workflow implemented here
 
 Three interchangeable back-ends are provided for each stage:
 
-* ``*_py``    - pure Python (``geopandas`` + ``rasterio`` + ``numpy`` /
-                ``scipy``).  No GIS install needed; this is the default.
+* ``*_py``    - pure Python (``geopandas`` + ``rasterio`` + ``numpy``).
+                No GIS install needed; this is the default.
 * ``*_arcpy`` - ArcGIS Pro / ArcPy Spatial Analyst.
 * ``*_qgis``  - QGIS Processing (GDAL / SAGA providers).
+
+An optional :func:`contours_to_dem_py` helper is kept for the case where you
+only have contour lines and need to build a DEM first, but the main pipeline
+assumes the DEM already exists.
 
 Example (pure Python)
 ---------------------
 >>> from svf_from_dem import run_pipeline_py
 >>> run_pipeline_py(
-...     contours="contours.shp",     elev_field="ELEV",
+...     dem="dem.tif",               # existing DEM raster (read directly)
 ...     buildings="buildings.gpkg",  height_field="height",
-...     cell_size=2.0,               # metres / pixel
-...     out_dem="dem.tif", out_dsm="dsm.tif", out_svf="svf.tif",
+...     out_dsm="dsm.tif", out_svf="svf.tif",
 ...     n_dirs=16, max_radius=200.0,
 ... )
 """
@@ -50,7 +54,9 @@ NODATA = -9999.0
 
 
 # ===========================================================================
-# Stage 1  -  Contours  ->  DEM
+# Optional helper  -  Contours  ->  DEM
+# (Only needed if you do NOT already have a DEM raster.  The main pipeline
+#  reads an existing DEM and does not call this.)
 # ===========================================================================
 
 
@@ -145,7 +151,7 @@ def contours_to_dem_py(
 
 
 # ===========================================================================
-# Stage 2  -  DEM + building heights  ->  DSM
+# Stage 1  -  DEM + building heights  ->  DSM
 # ===========================================================================
 
 
@@ -221,7 +227,7 @@ def add_buildings_to_dem_py(
 
 
 # ===========================================================================
-# Stage 3  -  DSM  ->  SVF
+# Stage 2  -  DSM  ->  SVF
 # ===========================================================================
 
 
@@ -316,22 +322,21 @@ def svf_from_dsm_py(
 
 
 def run_pipeline_py(
-    contours: str | Path,
-    elev_field: str,
+    dem: str | Path,
     buildings: str | Path,
     height_field: str,
-    cell_size: float,
-    out_dem: str | Path,
     out_dsm: str | Path,
     out_svf: str | Path,
     n_dirs: int = 16,
     max_radius: float = 200.0,
-    interp_method: str = "linear",
 ) -> str:
-    """Run the full contours -> DEM -> DSM -> SVF pipeline (pure Python)."""
-    contours_to_dem_py(contours, elev_field, cell_size, out_dem,
-                       method=interp_method)
-    add_buildings_to_dem_py(dem=out_dem, buildings=buildings,
+    """Run the DEM + buildings -> DSM -> SVF pipeline (pure Python).
+
+    *dem* is an existing DEM raster and is read directly; it is not computed
+    here.  If you only have contour lines, build a DEM first with
+    :func:`contours_to_dem_py` and pass its output as *dem*.
+    """
+    add_buildings_to_dem_py(dem=dem, buildings=buildings,
                             height_field=height_field, out_dsm=out_dsm)
     return svf_from_dsm_py(out_dsm, out_svf, n_dirs=n_dirs,
                            max_radius=max_radius)
@@ -399,43 +404,38 @@ def _write_raster(path, array, transform, crs) -> None:
 
 
 def run_pipeline_arcpy(
-    contours: str,
-    elev_field: str,
+    dem: str,
     buildings: str,
     height_field: str,
-    cell_size: float,
-    out_dem: str,
     out_dsm: str,
     out_svf: str,
+    cell_size: float | None = None,
 ) -> None:
-    """Full pipeline in ArcPy (Spatial Analyst + 3D Analyst extensions).
+    """DEM + buildings -> DSM -> SVF in ArcPy (Spatial Analyst extension).
 
-    Steps: TopoToRaster (contours -> DEM), PolygonToRaster on the height
-    field + Plus (DEM + buildings -> DSM), and the *Sky View Factor* tool.
+    Reads an existing DEM raster, adds building heights with
+    PolygonToRaster + Plus, then runs the *Sky View Factor* tool.
     """
     import arcpy
-    from arcpy.sa import Plus, SkyViewFactor, TopoContour  # type: ignore
+    from arcpy.sa import Plus, SkyViewFactor  # type: ignore
 
     arcpy.CheckOutExtension("Spatial")
-    arcpy.CheckOutExtension("3D")
+    if cell_size is None:
+        cell_size = arcpy.Describe(dem).meanCellWidth  # match the DEM grid
     arcpy.env.cellSize = cell_size
+    arcpy.env.snapRaster = dem
 
-    # 1. Contours -> DEM (TopoToRaster honours contour elevation lines).
-    arcpy.ddd.TopoToRaster(
-        [f"{contours} {elev_field} Contour"], out_dem, cell_size
-    )
-    # 2. Buildings -> height raster, then DEM + buildings.
+    # 1. Buildings -> height raster, then DEM + buildings.
     bld_ras = "in_memory/bld_h"
     arcpy.conversion.PolygonToRaster(
         buildings, height_field, bld_ras, cellsize=cell_size
     )
     bld = arcpy.sa.Con(arcpy.sa.IsNull(bld_ras), 0, bld_ras)
-    Plus(out_dem, bld).save(out_dsm)
-    # 3. DSM -> SVF.
+    Plus(dem, bld).save(out_dsm)
+    # 2. DSM -> SVF.
     SkyViewFactor(out_dsm, zenith_divisions=8, azimuth_divisions=16).save(out_svf)
 
     arcpy.CheckInExtension("Spatial")
-    arcpy.CheckInExtension("3D")
     logger.info("ArcPy SVF saved -> %s", out_svf)
 
 
@@ -445,38 +445,32 @@ def run_pipeline_arcpy(
 
 
 def run_pipeline_qgis(
-    contours: str,
-    elev_field: str,
+    dem: str,
     buildings: str,
     height_field: str,
-    cell_size: float,
-    out_dem: str,
     out_dsm: str,
     out_svf: str,
+    cell_size: float = 2.0,
     max_radius: float = 200.0,
 ) -> None:
-    """Full pipeline in QGIS Processing (run inside the QGIS Python console).
+    """DEM + buildings -> DSM -> SVF in QGIS Processing (QGIS Python console).
 
-    Steps: GDAL grid (contours -> DEM), rasterize + raster calculator
-    (DEM + buildings -> DSM), and SAGA *Sky View Factor* (DSM -> SVF).
+    Reads an existing DEM, rasterizes building heights and adds them with the
+    raster calculator, then runs SAGA *Sky View Factor*.
     """
     import processing  # type: ignore
+    from pathlib import Path as _P
 
-    # 1. Contours -> DEM (GDAL Grid, linear/TIN interpolation).
-    processing.run("gdal:gridinversedistancenearestneighbor", {
-        "INPUT": contours, "Z_FIELD": elev_field,
-        "OUTPUT": out_dem,
-    })
-    # 2. Buildings -> height raster aligned to the DEM.
-    bld_ras = out_dsm + "_bld.tif"
+    # 1. Buildings -> height raster aligned to the DEM.
+    bld_ras = str(_P(out_dsm).with_name(_P(out_dsm).stem + "_bld.tif"))
     processing.run("gdal:rasterize", {
         "INPUT": buildings, "FIELD": height_field,
         "UNITS": 1, "WIDTH": cell_size, "HEIGHT": cell_size,
         "INIT": 0, "OUTPUT": bld_ras,
     })
-    # 2b. DSM = DEM + buildings.
+    # 2. DSM = DEM + buildings.
     processing.run("gdal:rastercalculator", {
-        "INPUT_A": out_dem, "BAND_A": 1,
+        "INPUT_A": dem, "BAND_A": 1,
         "INPUT_B": bld_ras, "BAND_B": 1,
         "FORMULA": "A + B", "OUTPUT": out_dsm,
     })
@@ -495,39 +489,34 @@ def run_pipeline_qgis(
 if __name__ == "__main__":
     # ------------------------------------------------------------------ #
     # Folder layout: everything lives under one BASE folder, with each
-    # input and each output stage in its own subfolder.
+    # input and each output stage in its own subfolder.  The DEM is an
+    # existing raster that is read directly (not computed here).
     #
     #   BASE/
-    #     01_contours/  contours.shp      <- input: elevation contour lines
-    #     02_buildings/ buildings.gpkg    <- input: footprints with height
-    #     03_DEM/       dem.tif           <- output: interpolated terrain
-    #     04_DSM/       dsm.tif           <- output: terrain + buildings
-    #     05_SVF/       svf.tif           <- output: sky view factor
+    #     01_buildings/ buildings.gpkg    <- input: footprints with height
+    #     02_DEM/       dem.tif           <- input: existing DEM raster
+    #     03_DSM/       dsm.tif           <- output: terrain + buildings
+    #     04_SVF/       svf.tif           <- output: sky view factor
     #
-    # Edit BASE (and the field names below) to match your data.
+    # Edit BASE (and the field name below) to match your data.
     # ------------------------------------------------------------------ #
     BASE = Path(r"D:\SVF_project")
 
-    contours  = BASE / "01_contours"  / "contours.shp"
-    buildings = BASE / "02_buildings" / "buildings.gpkg"
-    out_dem   = BASE / "03_DEM" / "dem.tif"
-    out_dsm   = BASE / "04_DSM" / "dsm.tif"
-    out_svf   = BASE / "05_SVF" / "svf.tif"
+    buildings = BASE / "01_buildings" / "buildings.gpkg"
+    dem       = BASE / "02_DEM" / "dem.tif"     # read directly
+    out_dsm   = BASE / "03_DSM" / "dsm.tif"
+    out_svf   = BASE / "04_SVF" / "svf.tif"
 
     # Create the output subfolders if they don't exist yet
-    for _p in (out_dem, out_dsm, out_svf):
+    for _p in (out_dsm, out_svf):
         _p.parent.mkdir(parents=True, exist_ok=True)
 
     run_pipeline_py(
-        contours=contours,
-        elev_field="ELEV",        # contour elevation attribute (m)
+        dem=dem,
         buildings=buildings,
         height_field="height",    # building height attribute (m)
-        cell_size=2.0,            # output resolution (m/pixel)
-        out_dem=out_dem,
         out_dsm=out_dsm,
         out_svf=out_svf,
         n_dirs=16,                # azimuth directions
         max_radius=200.0,         # search radius (m)
-        interp_method="linear",   # TIN interpolation
     )
